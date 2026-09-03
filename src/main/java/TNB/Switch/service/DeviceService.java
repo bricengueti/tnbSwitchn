@@ -239,10 +239,10 @@ public class DeviceService {
      * Génère un pairingCode unique (16 bytes en Base64 URL-safe).
      */
     private String generatePairingCode() {
-        byte[] bytes = new byte[16];
-        RANDOM.nextBytes(bytes);
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+        SecureRandom random = new SecureRandom();
+        return String.format("%05d", random.nextInt(100000));
     }
+
 
     /**
      * Génère un credential de 32 bytes en Base64 URL-safe.
