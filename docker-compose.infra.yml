@@ -15,6 +15,8 @@ networks:
 
 volumes:
   kafka-data:
+  zookeeper-data:
+  zookeeper-log:
 
 services:
 
@@ -28,6 +30,13 @@ services:
     ports:
       - "2181:2181"
     volumes:
+      # Volumes persistants : le Cluster ID de Zookeeper vit ici. Sans ça,
+      # toute recréation du conteneur (ex: migration réseau) génère un
+      # nouveau Cluster ID qui ne correspond plus à celui stocké dans le
+      # meta.properties du volume kafka-data -> InconsistentClusterIdException
+      # au redémarrage de Kafka.
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     networks:
