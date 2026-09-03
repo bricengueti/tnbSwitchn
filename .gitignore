@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 HELP.md
 target/
 .mvn/wrapper/maven-wrapper.jar
@@ -31,3 +32,33 @@ build/
 
 ### VS Code ###
 .vscode/
+=======
+# Fichiers sensibles
+.env.dev
+.env.preprod
+.env.prod
+*.env
+*.secret
+*.key
+*.pem
+
+# Docker
+.dockerignore
+docker-compose.yml
+docker-compose.prod.yml
+Dockerfile
+
+# Maven / Build
+.mvn/
+mvnw
+mvnw.cmd
+target/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Logs
+*.log
+>>>>>>> 091b44a (test pipeline)
