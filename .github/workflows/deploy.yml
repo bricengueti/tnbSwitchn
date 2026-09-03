@@ -17,6 +17,12 @@ jobs:
   # "docker compose up -d" ne fait rien. Utilise uniquement des
   # secrets/variables au niveau repo (pas d'Environment requis),
   # donc jamais bloqué par une règle de protection d'Environment.
+  #
+  # Gère aussi la migration (idempotente) du réseau tnb-shared vers
+  # une subnet fixe (172.28.5.0/24), nécessaire pour que les règles
+  # ufw / pg_hba.conf restent stables entre deux recréations du
+  # réseau. Ne s'exécute qu'une seule fois en pratique : une fois la
+  # subnet correcte, ce bloc ne fait plus rien aux prochains pushs.
   # ============================================================
   deploy-infra:
     runs-on: ubuntu-latest
@@ -46,9 +52,54 @@ jobs:
             set -e
             mkdir -p /home/ubuntu/tnb-switch
             cd /home/ubuntu/tnb-switch
-            # Crée le réseau + zookeeper/kafka/kafka-ui s'ils n'existent pas
-            # encore ; ne les touche pas s'ils tournent déjà à l'identique.
+
+            DESIRED_SUBNET="172.28.5.0/24"
+
+            CURRENT_SUBNET=$(docker network inspect tnb-shared \
+              --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || echo "")
+
+            if [ "$CURRENT_SUBNET" != "$DESIRED_SUBNET" ]; then
+              echo "⚠️  Subnet tnb-shared actuelle ('$CURRENT_SUBNET') != cible ('$DESIRED_SUBNET') — migration du réseau."
+
+              # Arrête proprement l'infra (zookeeper/kafka/kafka-ui) si elle tourne déjà
+              docker compose -f docker-compose.infra.yml down || true
+
+              # Déconnecte de force tout conteneur encore attaché au réseau
+              # (backends dev/preprod/prod éventuellement déployés) pour
+              # pouvoir supprimer le réseau proprement.
+              ATTACHED=$(docker ps -aq --filter "network=tnb-shared" || true)
+              for c in $ATTACHED; do
+                echo "Déconnexion et arrêt du conteneur $c du réseau tnb-shared"
+                docker stop "$c" || true
+                docker network disconnect -f tnb-shared "$c" || true
+              done
+
+              docker network rm tnb-shared || true
+
+              echo "ℹ️  Réseau recréé avec la nouvelle subnet. Les backends déconnectés"
+              echo "    (dev/preprod/prod) seront réattachés par le job 'deploy' de CE"
+              echo "    pipeline pour l'environnement courant ; les AUTRES environnements"
+              echo "    devront être redéployés manuellement (relancer leur pipeline)."
+            else
+              echo "✅ Subnet tnb-shared déjà correcte ($CURRENT_SUBNET), pas de recréation."
+            fi
+
+            # Crée le réseau (avec la subnet fixée dans le fichier) + zookeeper/
+            # kafka/kafka-ui s'ils n'existent pas encore ; ne les touche pas
+            # s'ils tournent déjà à l'identique.
             docker compose -f docker-compose.infra.yml up -d
+
+            # Ouvre ufw pour cette subnet de façon idempotente : n'ajoute la
+            # règle que si elle n'existe pas déjà, et l'insère TOUJOURS avant
+            # la règle "5432 DENY IN Anywhere" existante (sinon elle ne
+            # servirait à rien, ufw évalue dans l'ordre, premier match gagne).
+            if ! sudo ufw status | grep -q "$DESIRED_SUBNET"; then
+              echo "Ajout de la règle ufw pour autoriser $DESIRED_SUBNET sur le port 5432"
+              sudo ufw insert 1 allow from $DESIRED_SUBNET to any port 5432 proto tcp comment 'Docker tnb-shared'
+              sudo ufw reload
+            else
+              echo "✅ Règle ufw pour $DESIRED_SUBNET déjà présente."
+            fi
 
   # ============================================================
   # JOB 2 — Build l'image Docker et la pousse sur Docker Hub
