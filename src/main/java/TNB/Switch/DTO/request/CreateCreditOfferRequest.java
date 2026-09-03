@@ -1,13 +1,15 @@
 package TNB.Switch.DTO.request;
 
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
 import java.math.BigDecimal;
 import java.util.UUID;
 
 public record CreateCreditOfferRequest(
-        String label,
-        UUID operateurId,
-        BigDecimal price,
-        BigDecimal creditAmount,
-        BigDecimal offerFeePercentage,  // ✅ Nouveau (défaut 0)
-        String executionTemplateContent
+        @NotBlank String label,
+        @Positive BigDecimal price,
+        @Positive BigDecimal creditAmount,
+        BigDecimal offerFeePercentage
+        // ❌ SUPPRIMER String executionTemplateContent
 ) {}

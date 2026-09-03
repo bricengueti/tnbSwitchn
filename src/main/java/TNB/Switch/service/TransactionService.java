@@ -7,6 +7,7 @@ import TNB.Switch.enums.CommandPhase;
 import TNB.Switch.enums.OfferType;
 import TNB.Switch.enums.TransactionStatus;
 import TNB.Switch.exeption.IllegalStateTransitionException;
+import TNB.Switch.exeption.InvalidPhoneNumberException;
 import TNB.Switch.exeption.ResourceNotFoundException;
 import TNB.Switch.messaging.CommandRoutingProducer;
 import TNB.Switch.messaging.CompensationProducer;
@@ -25,75 +26,7 @@ import java.util.UUID;
 /**
  * Chef d'orchestre de la state machine Transaction (CDC §9.4).
  *
- * =====================================================================
- *                    TRANSACTION STATE MACHINE
- * =====================================================================
- *
- *                              ┌─────────────────┐
- *                              │    WAIT_OTP     │  ← Transaction créée, OTP envoyé
- *                              └────────┬────────┘
- *                                       │ OTP validé par client
- *                                       ▼
- *                              ┌─────────────────┐
- *                              │QUEUE_WITHDRAWAL │  ← Commande retrait en file Kafka
- *                              └────────┬────────┘
- *                                       │ Device disponible (RoutingService)
- *                                       ▼
- *                              ┌─────────────────┐
- *                              │ ASK_WITHDRAWAL  │  ← Commande envoyée au device
- *                              └────────┬────────┘
- *                                       │ Message opérateur reçu
- *                                       │ (ReconciliationService)
- *              ┌────────────────────────┼────────────────────────┐
- *              │                        │                        │
- *              ▼                        ▼                        ▼
- *   ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
- *   │WITHDRAWAL_FAILED│     │WITHDRAWAL_DONE  │     │   CANCELLED     │
- *   │  (Terminal)     │     └────────┬────────┘     │  (Terminal)     │
- *   └─────────────────┘              │              └─────────────────┘
- *                                    │ Retrait réussi
- *                                    ▼
- *                              ┌─────────────────┐
- *                              │QUEUE_EXECUTE    │  ← Commande exécution en file
- *                              │  _COMMAND       │
- *                              └────────┬────────┘
- *                                       │ Device disponible (RoutingService)
- *                                       ▼
- *                              ┌─────────────────┐
- *                              │ROUTE_EXECUTE    │  ← Commande envoyée au device
- *                              │  _COMMAND       │
- *                              └────────┬────────┘
- *                                       │ Message opérateur reçu
- *                                       │ (ReconciliationService)
- *              ┌────────────────────────┼────────────────────────┐
- *              │                        │                        │
- *              ▼                        ▼                        ▼
- *   ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
- *   │EXECUTE_COMMAND_ │     │EXECUTE_COMMAND_ │     │COMPENSATION_    │
- *   │     DONE        │     │    FAILED       │     │  IN_PROGRESS    │  ← Retrait réussi
- *   │  (Terminal)     │     └────────┬────────┘     └────────┬────────┘  │   mais exécution
- *   └─────────────────┘              │                      │           │   échouée
- *                                    │                      │           │
- *                                    │                      ▼           │
- *                                    │               ┌─────────────────┐│
- *                                    │               │QUEUE_EXECUTE    ││  ← Retry automatique
- *                                    │               │  _COMMAND       ││  (max 3 tentatives)
- *                                    │               └────────┬────────┘│
- *                                    │                        │         │
- *                                    │                        ▼         │
- *                                    │               ┌─────────────────────┐
- *                                    └──────────────►│COMPENSATION_MANUAL │
- *                                                    │      _REVIEW       │  ← Reprise manuelle admin
- *                                                    │  (Terminal)        │
- *                                                    └─────────────────────┘
- *
- * =====================================================================
- * LÉGENDE :
- *   ┌─────────────┐  = État terminal (aucune transition sortante)
- *   ┌─────────────┐  = État intermédiaire (transition possible)
- *   ───────────────  = Transition normale
- *   ─ ─ ─ ─ ─ ─ ─  = Transition de compensation (retry)
- * =====================================================================
+ * Inclut la validation des numéros de téléphone via PhoneNumberValidationService.
  */
 @Service
 public class TransactionService {
@@ -106,44 +39,60 @@ public class TransactionService {
     private final CompensationProducer compensationProducer;
     private final CommandTemplateResolver templateResolver;
     private final AuthService authService;
+    private final PhoneNumberValidationService phoneNumberValidationService;  // ✅ AJOUT
+    private final OperateurService operateurService;  // ✅ AJOUT
 
     public TransactionService(TransactionRepository transactionRepository,
                               CommandeRepository commandeRepository,
                               CommandRoutingProducer commandRoutingProducer,
                               CompensationProducer compensationProducer,
                               CommandTemplateResolver templateResolver,
-                              AuthService authService) {
+                              AuthService authService,
+                              PhoneNumberValidationService phoneNumberValidationService,
+                              OperateurService operateurService) {
         this.transactionRepository = transactionRepository;
         this.commandeRepository = commandeRepository;
         this.commandRoutingProducer = commandRoutingProducer;
         this.compensationProducer = compensationProducer;
         this.templateResolver = templateResolver;
         this.authService = authService;
+        this.phoneNumberValidationService = phoneNumberValidationService;
+        this.operateurService = operateurService;
     }
 
     // ==================== CRÉATION ====================
-    // WAIT_OTP ← Transaction créée
 
     /**
      * Crée la transaction (idempotente via @Idempotent + contrainte DB).
      * Statut initial WAIT_OTP. Déclenche immédiatement l'envoi d'un OTP.
      *
-     * @param idempotencyKey Clé d'idempotence (générée par le client)
-     * @param client Utilisateur authentifié
-     * @param offer Offre sélectionnée
-     * @param destinationPhoneNumber Wallet destination (obligatoire EXCHANGE_MO)
-     * @param payerPhoneNumber Wallet source (obligatoire EXCHANGE_MO)
+     * ✅ Validation des numéros de téléphone intégrée.
      */
     @Idempotent
-    @Transactional
+    @Transactional("transactionManager")
     public Transaction createTransaction(
             @IdempotencyKey String idempotencyKey,
             User client,
             Offer offer,
             String destinationPhoneNumber,
-            String payerPhoneNumber) {
+            String payerPhoneNumber,
+            Operateur fromOperateur,    // ✅ AJOUT
+            Operateur toOperateur) {    // ✅ AJOUT
 
-        // Validation EXCHANGE_MO
+        // 1. Validation des opérateurs
+        if (fromOperateur == null || toOperateur == null) {
+            throw new IllegalArgumentException("Les opérateurs source et destination sont obligatoires");
+        }
+
+        // 2. Validation : l'opérateur source supporte le type d'offre
+        if (!fromOperateur.supportsOfferType(offer.getType())) {
+            throw new InvalidPhoneNumberException(
+                    String.format("L'opérateur source [%s] ne supporte pas le type d'offre [%s]",
+                            fromOperateur.getCode(), offer.getType())
+            );
+        }
+
+        // 3. Validation EXCHANGE_MO
         if (offer.getType() == OfferType.EXCHANGE_MO) {
             if (destinationPhoneNumber == null || destinationPhoneNumber.isBlank()) {
                 throw new IllegalArgumentException(
@@ -157,6 +106,10 @@ public class TransactionService {
             }
         }
 
+        // 4. ✅ Validation des numéros de téléphone
+        validatePhoneNumbers(payerPhoneNumber, destinationPhoneNumber, fromOperateur, toOperateur, offer);
+
+        // 5. Création de la transaction
         Transaction saved;
         try {
             Transaction transaction = new Transaction(
@@ -167,15 +120,15 @@ public class TransactionService {
                     idempotencyKey,
                     destinationPhoneNumber,
                     payerPhoneNumber,
-                    null
+                    fromOperateur,
+                    toOperateur
             );
             saved = transactionRepository.save(transaction);
-            log.info("Transaction créée [{}] pour client [{}], offre [{}], idempotencyKey [{}]",
-                    saved.getId(), client.getId(), offer.getId(), idempotencyKey);
+            log.info("Transaction créée [{}] pour client [{}], offre [{}], fromOperateur [{}], toOperateur [{}]",
+                    saved.getId(), client.getId(), offer.getId(),
+                    fromOperateur.getCode(), toOperateur.getCode());
 
         } catch (DataIntegrityViolationException e) {
-            // Idempotence : transaction déjà créée pour cette clé
-            // On ne renvoie PAS de nouvel OTP
             log.info("Transaction déjà existante pour idempotencyKey [{}]", idempotencyKey);
             return transactionRepository.findByClientAndIdempotencyKey(client, idempotencyKey)
                     .orElseThrow(() -> new IllegalStateException(
@@ -191,14 +144,12 @@ public class TransactionService {
     }
 
     // ==================== CONFIRMATION OTP + RETRAIT ====================
-    // WAIT_OTP → QUEUE_WITHDRAWAL
 
     /**
      * Point d'entrée unique de confirmation : le client transmet le
      * transactionId et le code OTP. Vérifie le code PUIS lance le retrait.
-     * Un seul geste atomique, jamais l'un sans l'autre.
      */
-    @Transactional
+    @Transactional("transactionManager")
     public Transaction confirmOtpAndQueueWithdrawal(UUID transactionId, String otpCode) {
         Transaction transaction = findTransaction(transactionId);
 
@@ -209,23 +160,26 @@ public class TransactionService {
             );
         }
 
-        // Vérification du code — lève une exception explicite si invalide
+        // Vérification du code OTP
         authService.verifyOtp(transaction.getClient().getPhoneNumber(), otpCode);
 
         // Transition vers la file d'attente du retrait
         transitionTo(transaction, TransactionStatus.QUEUE_WITHDRAWAL);
 
-        // Résoudre le template de retrait DEPUIS L'OPÉRATEUR (pas depuis l'offre)
-        Operateur sourceOperator = transaction.getOffer().getSourceOperator();
-        if (sourceOperator.getWithdrawalCommandTemplate() == null) {
+        // ✅ Résoudre le template de retrait DEPUIS L'OPÉRATEUR DESTINATION
+        Operateur toOperateur = transaction.getToOperateur();
+        if (toOperateur == null) {
+            throw new IllegalStateException("L'opérateur destination n'est pas défini pour la transaction");
+        }
+        if (toOperateur.getWithdrawalCommandTemplate() == null) {
             throw new IllegalStateException(
                     "L'opérateur [%s] n'a pas de gabarit de retrait configuré"
-                            .formatted(sourceOperator.getCode())
+                            .formatted(toOperateur.getCode())
             );
         }
 
         String resolvedContent = templateResolver.resolve(
-                sourceOperator.getWithdrawalCommandTemplate(),
+                toOperateur.getWithdrawalCommandTemplate(),
                 transaction,
                 null,
                 null
@@ -235,7 +189,7 @@ public class TransactionService {
         Commande withdrawalCommande = new Commande(
                 transaction,
                 CommandPhase.WITHDRAWAL,
-                sourceOperator,
+                toOperateur,
                 resolvedContent
         );
         commandeRepository.save(withdrawalCommande);
@@ -243,21 +197,15 @@ public class TransactionService {
         // Publier pour routage
         commandRoutingProducer.publishForRouting(withdrawalCommande);
 
-        log.info("Transaction [{}] : OTP validé, retrait mis en file, commande [{}] publiée",
-                transactionId, withdrawalCommande.getId());
+        log.info("Transaction [{}] : OTP validé, retrait mis en file, commande [{}] publiée vers opérateur [{}]",
+                transactionId, withdrawalCommande.getId(), toOperateur.getCode());
 
         return transaction;
     }
 
     // ==================== ROUTAGE ====================
-    // QUEUE_WITHDRAWAL → ASK_WITHDRAWAL
-    // QUEUE_EXECUTE_COMMAND → ROUTE_EXECUTE_COMMAND
 
-    /**
-     * Appelé par CommandRoutingConsumer juste après qu'un device a été
-     * verrouillé (HOLDS) pour cette commande.
-     */
-    @Transactional
+    @Transactional("transactionManager")
     public void markCommandRouted(Commande commande) {
         Transaction transaction = commande.getTransaction();
 
@@ -271,57 +219,39 @@ public class TransactionService {
     }
 
     // ==================== RÉSULTATS ====================
-    // ASK_WITHDRAWAL → WITHDRAWAL_DONE ou WITHDRAWAL_FAILED
 
-    /**
-     * Traite le résultat du retrait (appelé par ReconciliationService).
-     */
     @Transactional
     public void handleWithdrawalResult(UUID transactionId, boolean success) {
         Transaction transaction = findTransaction(transactionId);
 
         if (!success) {
-            // ASK_WITHDRAWAL → WITHDRAWAL_FAILED (Terminal)
             transitionTo(transaction, TransactionStatus.WITHDRAWAL_FAILED);
             transaction.setCompletedAt(Instant.now());
             log.info("Transaction [{}] : retrait échoué, aucun débit effectif", transactionId);
             return;
         }
 
-        // ASK_WITHDRAWAL → WITHDRAWAL_DONE
         transitionTo(transaction, TransactionStatus.WITHDRAWAL_DONE);
         log.info("Transaction [{}] : retrait confirmé réussi", transactionId);
 
-        // Enchaîner sur l'exécution → QUEUE_EXECUTE_COMMAND
         queueExecutionCommand(transaction);
     }
 
-    // ROUTE_EXECUTE_COMMAND → EXECUTE_COMMAND_DONE ou EXECUTE_COMMAND_FAILED
-    // EXECUTE_COMMAND_FAILED → COMPENSATION_IN_PROGRESS
-
-    /**
-     * Traite le résultat de l'exécution (appelé par ReconciliationService).
-     * Gère le cas critique : retrait réussi / exécution échouée → compensation.
-     */
-    @Transactional
+    @Transactional("transactionManager")
     public void handleExecutionResult(UUID transactionId, UUID failedCommandeId, boolean success) {
         Transaction transaction = findTransaction(transactionId);
 
         if (success) {
-            // ROUTE_EXECUTE_COMMAND → EXECUTE_COMMAND_DONE (Terminal)
             transitionTo(transaction, TransactionStatus.EXECUTE_COMMAND_DONE);
             transaction.setCompletedAt(Instant.now());
             log.info("Transaction [{}] : exécution confirmée réussie, transaction terminée", transactionId);
             return;
         }
 
-        // ÉCHEC : retrait réussi mais exécution échouée
-        // ROUTE_EXECUTE_COMMAND → EXECUTE_COMMAND_FAILED
         transitionTo(transaction, TransactionStatus.EXECUTE_COMMAND_FAILED);
         log.warn("Transaction [{}] : exécution échouée après retrait réussi — déclenchement compensation",
                 transactionId);
 
-        // EXECUTE_COMMAND_FAILED → COMPENSATION_IN_PROGRESS
         transitionTo(transaction, TransactionStatus.COMPENSATION_IN_PROGRESS);
 
         Commande failedCommande = commandeRepository.findById(failedCommandeId)
@@ -331,24 +261,15 @@ public class TransactionService {
     }
 
     // ==================== COMPENSATION ====================
-    // COMPENSATION_IN_PROGRESS → QUEUE_EXECUTE_COMMAND (retry) ou COMPENSATION_MANUAL_REVIEW (épuisé)
 
-    /**
-     * Remet une transaction en file d'attente pour retry (appelé par CompensationConsumer).
-     * COMPENSATION_IN_PROGRESS → QUEUE_EXECUTE_COMMAND
-     */
-    @Transactional
+    @Transactional("transactionManager")
     public void requeueForCompensationRetry(UUID transactionId) {
         Transaction transaction = findTransaction(transactionId);
         transitionTo(transaction, TransactionStatus.QUEUE_EXECUTE_COMMAND);
         log.info("Transaction [{}] : remise en file pour retry de compensation", transactionId);
     }
 
-    /**
-     * Bascule une transaction en reprise manuelle admin (appelé par CompensationConsumer).
-     * COMPENSATION_IN_PROGRESS → COMPENSATION_MANUAL_REVIEW (Terminal)
-     */
-    @Transactional
+    @Transactional("transactionManager")
     public void markCompensationManualReview(UUID transactionId) {
         Transaction transaction = findTransaction(transactionId);
         transitionTo(transaction, TransactionStatus.COMPENSATION_MANUAL_REVIEW);
@@ -358,27 +279,94 @@ public class TransactionService {
     // ==================== PRIVÉES ====================
 
     /**
-     * Met en file la commande d'exécution (recharge crédit/data ou dépôt MO).
-     * WITHDRAWAL_DONE → QUEUE_EXECUTE_COMMAND
+     * ✅ Valide les numéros de téléphone.
+     */
+    private void validatePhoneNumbers(String payerPhoneNumber,
+                                      String destinationPhoneNumber,
+                                      Operateur fromOperateur,
+                                      Operateur toOperateur,
+                                      Offer offer) {
+        // Pour CREDIT et DATA, seul le numéro du destinataire est requis
+        if (offer.getType() == OfferType.CREDIT || offer.getType() == OfferType.DATA) {
+            if (destinationPhoneNumber == null || destinationPhoneNumber.isBlank()) {
+                throw new IllegalArgumentException(
+                        "Un numéro de destination est requis pour les offres CREDIT et DATA"
+                );
+            }
+            phoneNumberValidationService.validatePhoneNumberBelongsToOperateur(
+                    destinationPhoneNumber, toOperateur
+            );
+            // Le payerPhoneNumber n'est pas requis pour CREDIT/DATA
+            // (le client paie depuis son propre compte)
+            return;
+        }
+
+        // Pour EXCHANGE_MO, les deux numéros sont requis
+        if (offer.getType() == OfferType.EXCHANGE_MO) {
+            // Payer
+            if (payerPhoneNumber == null || payerPhoneNumber.isBlank()) {
+                throw new IllegalArgumentException(
+                        "Un numéro source (payer) est requis pour les offres EXCHANGE_MO"
+                );
+            }
+            phoneNumberValidationService.validatePhoneNumberBelongsToOperateur(
+                    payerPhoneNumber, fromOperateur
+            );
+
+            // Destination
+            if (destinationPhoneNumber == null || destinationPhoneNumber.isBlank()) {
+                throw new IllegalArgumentException(
+                        "Un numéro de destination est requis pour les offres EXCHANGE_MO"
+                );
+            }
+            phoneNumberValidationService.validatePhoneNumberBelongsToOperateur(
+                    destinationPhoneNumber, toOperateur
+            );
+
+            // Vérifier que les numéros sont différents
+            if (payerPhoneNumber.replaceAll("[^0-9]", "")
+                    .equals(destinationPhoneNumber.replaceAll("[^0-9]", ""))) {
+                throw new InvalidPhoneNumberException(
+                        "Le numéro de l'émetteur et du destinataire ne peuvent pas être identiques"
+                );
+            }
+        }
+    }
+
+    /**
+     * Met en file la commande d'exécution.
      */
     private void queueExecutionCommand(Transaction transaction) {
         transitionTo(transaction, TransactionStatus.QUEUE_EXECUTE_COMMAND);
 
-        // Résoudre le template d'exécution (spécifique à l'offre)
+        // ✅ Récupérer le template d'exécution depuis l'opérateur source
+        Operateur fromOperateur = transaction.getFromOperateur();
+        if (fromOperateur == null) {
+            throw new IllegalStateException("L'opérateur source n'est pas défini pour la transaction");
+        }
+
+        CommandTemplate executionTemplate = fromOperateur.getExecutionTemplateForOfferType(
+                transaction.getOffer().getType()
+        );
+        if (executionTemplate == null) {
+            throw new IllegalStateException(
+                    "L'opérateur [%s] n'a pas de template d'exécution pour le type d'offre [%s]"
+                            .formatted(fromOperateur.getCode(), transaction.getOffer().getType())
+            );
+        }
+
         String resolvedContent = templateResolver.resolve(
-                transaction.getOffer().getExecutionCommandTemplate(),
+                executionTemplate,
                 transaction,
                 transaction.getDestinationPhoneNumber(),
                 transaction.getPayerPhoneNumber()
         );
 
-        // Déterminer l'opérateur d'exécution
-        Operateur executionOperator = resolveExecutionOperator(transaction);
-
+        // ✅ L'opérateur d'exécution est l'opérateur source (fromOperateur)
         Commande executionCommande = new Commande(
                 transaction,
                 CommandPhase.EXECUTION,
-                executionOperator,
+                fromOperateur,
                 resolvedContent
         );
         commandeRepository.save(executionCommande);
@@ -386,24 +374,9 @@ public class TransactionService {
         commandRoutingProducer.publishForRouting(executionCommande);
 
         log.info("Transaction [{}] : exécution mise en file, commande [{}] publiée, opérateur [{}]",
-                transaction.getId(), executionCommande.getId(), executionOperator.getCode());
+                transaction.getId(), executionCommande.getId(), fromOperateur.getCode());
     }
 
-    /**
-     * Résout l'opérateur d'exécution :
-     * - EXCHANGE_MO → destinationOperator
-     * - CREDIT/DATA → sourceOperator
-     */
-    private Operateur resolveExecutionOperator(Transaction transaction) {
-        Offer offer = transaction.getOffer();
-        return offer.getDestinationOperator() != null
-                ? offer.getDestinationOperator()
-                : offer.getSourceOperator();
-    }
-
-    /**
-     * Transitionne la transaction vers un nouveau statut (valide via TransactionStateMachine).
-     */
     private void transitionTo(Transaction transaction, TransactionStatus target) {
         TransactionStatus current = transaction.getStatus();
         if (!TransactionStateMachine.canTransition(current, target)) {

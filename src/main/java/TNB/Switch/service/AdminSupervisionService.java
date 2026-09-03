@@ -1,9 +1,14 @@
 package TNB.Switch.service;
 
-
+import TNB.Switch.DTO.response.PendingCompensationResponse;
+import TNB.Switch.DTO.response.PendingReconciliationResponse;
+import TNB.Switch.DTO.response.StuckCommandeResponse;
 import TNB.Switch.entity.*;
 import TNB.Switch.enums.*;
 import TNB.Switch.exeption.ResourceNotFoundException;
+import TNB.Switch.mapper.PendingCompensationMapper;
+import TNB.Switch.mapper.PendingReconciliationMapper;
+import TNB.Switch.mapper.StuckCommandeMapper;
 import TNB.Switch.messaging.CommandRoutingProducer;
 import TNB.Switch.messaging.CompensationProducer;
 import TNB.Switch.repository.*;
@@ -28,9 +33,37 @@ import static TNB.Switch.specification.TransactionSpecifications.hasStatus;
  * du pipeline : messages opérateurs AMBIGUOUS (§9.3bis), transactions en
  * COMPENSATION_MANUAL_REVIEW (§8.4), commandes jamais routées (DLQ
  * routage). Exploite les Specifications déjà posées plutôt que des
- * méthodes dérivées dédiées — cohérent avec le reste du projet et prêt
- * à accueillir d'autres filtres (device, opérateur, période...) sans
- * multiplier les méthodes de repository.
+ * méthodes dérivées dédiées.
+ *
+ * =====================================================================
+ *                    ADMIN SUPERVISION SERVICE
+ * =====================================================================
+ *
+ *  ┌─────────────────────────────────────────────────────────────────────┐
+ *  │  FILE 1 : Messages AMBIGUOUS (Réconciliation)                     │
+ *  │  ───────────────────────────────────────────────────────────────── │
+ *  │  findPendingReconciliation()                                      │
+ *  │  → resolveManually(messageId, commandeId, success)               │
+ *  │  → dismissAsUnrelated(messageId)                                 │
+ *  └─────────────────────────────────────────────────────────────────────┘
+ *                                │
+ *                                ▼
+ *  ┌─────────────────────────────────────────────────────────────────────┐
+ *  │  FILE 2 : Transactions COMPENSATION_MANUAL_REVIEW                 │
+ *  │  ───────────────────────────────────────────────────────────────── │
+ *  │  findPendingCompensationReview()                                  │
+ *  │  → retryCompensationManually(transactionId)                      │
+ *  └─────────────────────────────────────────────────────────────────────┘
+ *                                │
+ *                                ▼
+ *  ┌─────────────────────────────────────────────────────────────────────┐
+ *  │  FILE 3 : Commandes jamais routées (DLQ)                          │
+ *  │  ───────────────────────────────────────────────────────────────── │
+ *  │  findStuckUnroutedCommands(thresholdSeconds)                     │
+ *  │  → forceReroute(commandeId)                                      │
+ *  └─────────────────────────────────────────────────────────────────────┘
+ *
+ * =====================================================================
  */
 @Service
 public class AdminSupervisionService {
@@ -38,20 +71,8 @@ public class AdminSupervisionService {
     private static final Logger log = LoggerFactory.getLogger(AdminSupervisionService.class);
 
     private final MessageOperateurBrutRepository messageRepository;
-    private final TransactionRepository transactionRepository;
-    private final CommandeRepository commandeRepository;
-    private final CompensationAttemptRepository compensationAttemptRepository;
-    private final TransactionService transactionService;
-    private final CommandRoutingProducer commandRoutingProducer;
-    private final CompensationProducer compensationProducer;
 
-    public AdminSupervisionService(
-            MessageOperateurBrutRepository messageRepository,
-            TransactionRepository transactionRepository,
-            CommandeRepository commandeRepository,
-            CompensationAttemptRepository compensationAttemptRepository,
-            TransactionService transactionService,
-            CommandRoutingProducer commandRoutingProducer, CompensationProducer compensationProducer) {
+    public AdminSupervisionService(MessageOperateurBrutRepository messageRepository, TransactionRepository transactionRepository, CommandeRepository commandeRepository, CompensationAttemptRepository compensationAttemptRepository, TransactionService transactionService, CommandRoutingProducer commandRoutingProducer, CompensationProducer compensationProducer, PendingReconciliationMapper pendingReconciliationMapper, PendingCompensationMapper pendingCompensationMapper, StuckCommandeMapper stuckCommandeMapper) {
         this.messageRepository = messageRepository;
         this.transactionRepository = transactionRepository;
         this.commandeRepository = commandeRepository;
@@ -59,47 +80,82 @@ public class AdminSupervisionService {
         this.transactionService = transactionService;
         this.commandRoutingProducer = commandRoutingProducer;
         this.compensationProducer = compensationProducer;
+        this.pendingReconciliationMapper = pendingReconciliationMapper;
+        this.pendingCompensationMapper = pendingCompensationMapper;
+        this.stuckCommandeMapper = stuckCommandeMapper;
     }
 
-    // ===== LECTURE — les 3 files, via Specifications =====
+    private final TransactionRepository transactionRepository;
+    private final CommandeRepository commandeRepository;
+    private final CompensationAttemptRepository compensationAttemptRepository;
+    private final TransactionService transactionService;
+    private final CommandRoutingProducer commandRoutingProducer;
+    private final CompensationProducer compensationProducer;
 
-    public List<MessageOperateurBrut> findPendingReconciliation() {
+    // Mappers
+    private final PendingReconciliationMapper pendingReconciliationMapper;
+    private final PendingCompensationMapper pendingCompensationMapper;
+    private final StuckCommandeMapper stuckCommandeMapper;
+
+
+
+    // =====================================================================
+    //  LECTURE — LES 3 FILES
+    // =====================================================================
+
+    /**
+     * File 1 : Messages opérateurs en attente de reprise manuelle (AMBIGUOUS).
+     */
+    public List<PendingReconciliationResponse> findPendingReconciliation() {
         Specification<MessageOperateurBrut> spec =
                 hasProcessingStatus(MessageProcessingStatus.AMBIGUOUS);
-        return messageRepository.findAll(spec, Sort.by(Sort.Direction.DESC, "receivedAt"));
-    }
-
-    public List<Transaction> findPendingCompensationReview() {
-        Specification<Transaction> spec =
-                hasStatus(TransactionStatus.COMPENSATION_MANUAL_REVIEW);
-        return transactionRepository.findAll(spec, Sort.by(Sort.Direction.DESC, "createdAt"));
+        return messageRepository.findAll(spec, Sort.by(Sort.Direction.DESC, "receivedAt"))
+                .stream()
+                .map(pendingReconciliationMapper)
+                .toList();
     }
 
     /**
-     * Commandes en file depuis plus de thresholdSeconds sans device —
-     * combine hasNoDevice() et createdBefore() : exactement le genre de
-     * composition que les Specifications permettent d'éviter de dupliquer
-     * en @Query figée dans le repository.
+     * File 2 : Transactions en attente de reprise manuelle (COMPENSATION_MANUAL_REVIEW).
      */
-    public List<Commande> findStuckUnroutedCommands(int thresholdSeconds) {
+    public List<PendingCompensationResponse> findPendingCompensationReview() {
+        Specification<Transaction> spec =
+                hasStatus(TransactionStatus.COMPENSATION_MANUAL_REVIEW);
+        return transactionRepository.findAll(spec, Sort.by(Sort.Direction.DESC, "createdAt"))
+                .stream()
+                .map(pendingCompensationMapper)
+                .toList();
+    }
+
+    /**
+     * File 3 : Commandes en file depuis plus de thresholdSeconds sans device.
+     * Combine hasNoDevice() et createdBefore() via Specifications.
+     */
+    public List<StuckCommandeResponse> findStuckUnroutedCommands(int thresholdSeconds) {
         Instant threshold = Instant.now().minusSeconds(thresholdSeconds);
         Specification<Commande> spec = Specification
                 .where(hasNoDevice())
                 .and(createdBefore(threshold));
-        return commandeRepository.findAll(spec, Sort.by(Sort.Direction.ASC, "createdAt"));
+        return commandeRepository.findAll(spec, Sort.by(Sort.Direction.ASC, "createdAt"))
+                .stream()
+                .map(stuckCommandeMapper)
+                .toList();
     }
 
+    /**
+     * Compte le nombre de tentatives de compensation pour une transaction.
+     */
     public int countCompensationAttempts(Transaction transaction) {
         return compensationAttemptRepository.countByTransaction(transaction);
     }
 
-    // ===== ACTIONS — intervention manuelle explicite =====
+    // =====================================================================
+    //  ACTIONS — INTERVENTION MANUELLE
+    // =====================================================================
 
     /**
-     * Résolution manuelle d'un message AMBIGUOUS/UNMATCHED : l'admin
-     * tranche lui-même quelle Commande correspond réellement, après
-     * examen du contenu brut. Contourne le matching automatique, mais
-     * reste tracé (created_by = l'admin, via TnbAuditorAware).
+     * Résolution manuelle d'un message AMBIGUOUS/UNMATCHED.
+     * L'admin tranche lui-même quelle Commande correspond réellement.
      */
     @Transactional
     public void resolveManually(UUID messageId, UUID commandeId, boolean success) {
@@ -123,16 +179,22 @@ public class AdminSupervisionService {
             transactionService.handleExecutionResult(transaction.getId(), commande.getId(), success);
         }
     }
-    // Ajout à AdminSupervisionService
 
     /**
-     * Relance manuelle d'une compensation bloquée en COMPENSATION_MANUAL_REVIEW —
-     * l'admin décide de retenter malgré l'épuisement des 3 tentatives
-     * automatiques (ex. il a constaté que la flotte a été réapprovisionnée
-     * depuis). Republie directement sur le topic de compensation, sans reset
-     * du compteur de CompensationAttempt : la nouvelle tentative s'ajoute à
-     * l'historique existant plutôt que de repartir de zéro, pour garder une
-     * traçabilité complète du nombre réel de tentatives (automatiques + manuelles).
+     * Rejette un message comme hors-sujet (UNRELATED).
+     */
+    @Transactional
+    public void dismissAsUnrelated(UUID messageId) {
+        MessageOperateurBrut message = messageRepository.findById(messageId)
+                .orElseThrow(() -> new ResourceNotFoundException("MessageOperateurBrut", messageId));
+
+        message.setProcessingStatus(MessageProcessingStatus.CLOSED_UNRELATED);
+        log.info("Message [{}] rejeté manuellement comme hors-sujet par un admin", messageId);
+    }
+
+    /**
+     * Relance manuelle d'une compensation bloquée en COMPENSATION_MANUAL_REVIEW.
+     * L'admin décide de retenter malgré l'épuisement des 3 tentatives.
      */
     @Transactional
     public void retryCompensationManually(UUID transactionId) {
@@ -149,6 +211,10 @@ public class AdminSupervisionService {
                 .filter(c -> c.getPhase() == CommandPhase.EXECUTION)
                 .toList();
 
+        if (executionCommandes.isEmpty()) {
+            throw new IllegalStateException("Aucune commande EXECUTION trouvée pour cette transaction");
+        }
+
         Commande lastFailedCommande = executionCommandes.get(executionCommandes.size() - 1);
 
         compensationProducer.publishManualRetry(transaction, lastFailedCommande);
@@ -157,19 +223,20 @@ public class AdminSupervisionService {
                 transactionId, countCompensationAttempts(transaction) + 1);
     }
 
-    @Transactional
-    public void dismissAsUnrelated(UUID messageId) {
-        MessageOperateurBrut message = messageRepository.findById(messageId)
-                .orElseThrow(() -> new ResourceNotFoundException("MessageOperateurBrut", messageId));
-
-        message.setProcessingStatus(MessageProcessingStatus.CLOSED_UNRELATED);
-        log.info("Message [{}] rejeté manuellement comme hors-sujet par un admin", messageId);
-    }
-
+    /**
+     * Force le reroutage d'une commande jamais routée (DLQ).
+     */
     @Transactional
     public void forceReroute(UUID commandeId) {
         Commande commande = commandeRepository.findById(commandeId)
                 .orElseThrow(() -> new ResourceNotFoundException("Commande", commandeId));
+
+        if (commande.getDevice() != null) {
+            throw new IllegalStateException(
+                    "La commande [%s] est déjà routée vers le device [%s]"
+                            .formatted(commandeId, commande.getDevice().getId())
+            );
+        }
 
         commandRoutingProducer.publishForRouting(commande);
         log.info("Commande [{}] republiée manuellement pour routage par un admin", commandeId);

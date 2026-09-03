@@ -39,8 +39,7 @@ import org.springframework.stereotype.Component;
  *                 │
  *                 ▼
  *      ┌─────────────────────────────────────┐
- *      │ kafkaTemplate.executeInTransaction │
- *      │   operations.send(topic, key, event)│
+ *      │ kafkaTemplate.send(topic, key, event)│
  *      └─────────────────────────────────────┘
  *                 │
  *                 ▼
@@ -100,7 +99,7 @@ public class CommandRoutingProducer {
      * - WITHDRAWAL → withdrawal-topic
      * - EXECUTION → execution-topic
      *
-     * Le message est un ticket ({ commandeId: UUID }) envoyé en transaction.
+     * Le message est un ticket ({ commandeId: UUID }) envoyé sans transaction.
      */
     public void publishForRouting(Commande commande) {
         String topic = switch (commande.getPhase()) {
@@ -109,9 +108,8 @@ public class CommandRoutingProducer {
         };
         CommandRoutingEvent event = new CommandRoutingEvent(commande.getId());
 
-        kafkaTemplate.executeInTransaction(operations ->
-                operations.send(topic, commande.getId().toString(), event)
-        );
+        // ✅ Envoi simple sans transaction
+        kafkaTemplate.send(topic, commande.getId().toString(), event);
 
         log.info("Commande [{}] publiée sur le topic {}", commande.getId(), topic);
     }

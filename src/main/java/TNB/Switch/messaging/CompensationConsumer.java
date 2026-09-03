@@ -54,26 +54,34 @@ public class CompensationConsumer {
         this.transactionService = transactionService;
         this.notificationService = notificationService;
     }
-    @KafkaListener(topics = "${tnb.routing.compensation-topic}")
+
+    @KafkaListener(topics = "${tnb.routing.compensation-topic}", containerFactory = "compensationKafkaListenerContainerFactory")
     @Transactional
     public void consumeCompensation(@Payload CompensationEvent event, Acknowledgment ack) {
+        log.debug("Réception d'un événement de compensation pour la transaction [{}]", event.transactionId());
+
+        // 1. Charger la transaction
         Transaction transaction = transactionRepository.findById(event.transactionId())
                 .orElseThrow(() -> new IllegalStateException(
                         "Transaction introuvable pour compensation : " + event.transactionId()
                 ));
 
+        // 2. Charger la commande ayant échoué
         Commande failedCommande = commandeRepository.findById(event.failedCommandeId())
                 .orElseThrow(() -> new IllegalStateException(
                         "Commande introuvable pour compensation : " + event.failedCommandeId()
                 ));
 
+        // 3. Vérifier le nombre de tentatives
         int attemptsSoFar = compensationAttemptRepository.countByTransaction(transaction);
 
         // La limite de 3 ne s'applique qu'aux tentatives automatiques —
         // une relance manuelle admin (isManualRetry=true) est un choix humain
         // explicite qui contourne volontairement cette limite.
         if (!event.isManualRetry() && attemptsSoFar >= MAX_COMPENSATION_ATTEMPTS) {
+            // ⚠️ Ceci est une opération DB, elle sera commitée dans la même transaction
             transactionService.markCompensationManualReview(transaction.getId());
+
             log.error(
                     "Transaction [{}] : {} tentatives de compensation épuisées, bascule en reprise manuelle admin",
                     transaction.getId(), MAX_COMPENSATION_ATTEMPTS
@@ -86,19 +94,26 @@ public class CompensationConsumer {
             return;
         }
 
+        // 4. Créer une nouvelle commande de retry
         Commande retryCommande = new Commande(
                 transaction, CommandPhase.EXECUTION,
                 failedCommande.getOperateur(), failedCommande.getResolvedContent()
         );
         commandeRepository.save(retryCommande);
 
+        // 5. Enregistrer la tentative de compensation
         int attemptNumber = attemptsSoFar + 1;
         compensationAttemptRepository.save(
                 new CompensationAttempt(transaction, retryCommande, attemptNumber)
         );
 
+        // 6. Mettre à jour le statut de la transaction
         transactionService.requeueForCompensationRetry(transaction.getId());
 
+        // 7. Publier la nouvelle commande pour routage
+        // ⚠️ Important : Cet envoi se fait dans la transaction.
+        // Si l'envoi Kafka échoue, la transaction est rollbackée.
+        // C'est le comportement souhaité pour maintenir la cohérence.
         commandRoutingProducer.publishForRouting(retryCommande);
 
         log.warn("Transaction [{}] : tentative de compensation {} ({}) — nouvelle commande [{}] publiée pour routage",

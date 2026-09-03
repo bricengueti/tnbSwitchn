@@ -4,9 +4,10 @@ import TNB.Switch.DTO.response.CommandeResponse;
 import TNB.Switch.DTO.response.DeviceSummaryResponse;
 import TNB.Switch.DTO.response.OperateurSummaryResponse;
 import TNB.Switch.entity.Commande;
+import org.springframework.stereotype.Component;
 
 import java.util.function.Function;
-
+@Component
 public class CommandeMapper implements Function<Commande, CommandeResponse> {
 
     private final DeviceSummaryMapper deviceSummaryMapper = new DeviceSummaryMapper();

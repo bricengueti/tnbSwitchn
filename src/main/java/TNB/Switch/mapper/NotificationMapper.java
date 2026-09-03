@@ -2,9 +2,10 @@ package TNB.Switch.mapper;
 
 import TNB.Switch.DTO.response.NotificationResponse;
 import TNB.Switch.entity.Notification;
+import org.springframework.stereotype.Component;
 
 import java.util.function.Function;
-
+@Component
 public class NotificationMapper implements Function<Notification, NotificationResponse> {
 
     @Override

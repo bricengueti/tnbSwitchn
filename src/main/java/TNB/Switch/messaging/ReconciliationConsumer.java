@@ -1,4 +1,5 @@
 package TNB.Switch.messaging;
+
 import TNB.Switch.entity.MessageOperateurBrut;
 import TNB.Switch.enums.MessageProcessingStatus;
 import TNB.Switch.exeption.ResourceNotFoundException;
@@ -16,6 +17,7 @@ import org.springframework.kafka.retrytopic.DltStrategy;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
 /**
  * Reçoit le ticket "message à réconcilier", appelle l'IA de façon
@@ -34,45 +36,53 @@ public class ReconciliationConsumer {
     private final ReconciliationService reconciliationService;
     private final NotificationService notificationService;
 
-
     public ReconciliationConsumer(MessageOperateurBrutRepository messageRepository,
                                   IaReconciliationClient iaClient,
-                                  ReconciliationService reconciliationService, NotificationService notificationService) {
+                                  ReconciliationService reconciliationService,
+                                  NotificationService notificationService) {
         this.messageRepository = messageRepository;
         this.iaClient = iaClient;
         this.reconciliationService = reconciliationService;
         this.notificationService = notificationService;
     }
 
+    /**
+     * Consomme les tickets de réconciliation depuis reconciliation-topic.
+     */
     @RetryableTopic(
-            attempts = "${tnb.ia.reconciliation.max-retries}",
+            attempts = "${tnb.ia.reconciliation.max-retries:3}",
             backoff = @org.springframework.retry.annotation.Backoff(
-                    delayExpression = "${tnb.routing.retry-delay-seconds} * 1000"
+                    delayExpression = "#{${tnb.routing.retry-delay-seconds:30} * 1000}"
             ),
-            dltStrategy = DltStrategy.FAIL_ON_ERROR
-            // Pas de include() ciblé ici, contrairement à CommandRoutingConsumer :
-            // toute exception (timeout IA, service down, erreur réseau) doit
-            // déclencher un retry — l'IA est un service externe, on ne sait
-            // pas a priori quel type d'exception une panne va lever.
+            dltStrategy = DltStrategy.FAIL_ON_ERROR,
+            kafkaTemplate = "defaultRetryTopicKafkaTemplate"  // ⬅️ AJOUT
     )
-    @KafkaListener(topics = "${tnb.reconciliation.topic}")
+    @KafkaListener(topics = "${tnb.reconciliation.topic}", containerFactory = "reconciliationKafkaListenerContainerFactory")
+    @Transactional
     public void consume(@Payload ReconciliationEvent event, Acknowledgment ack) {
+        log.debug("Réception du ticket de réconciliation pour le message [{}]", event.messageId());
+
+        // 1. Charger le message
         MessageOperateurBrut message = messageRepository.findById(event.messageId())
                 .orElseThrow(() -> new ResourceNotFoundException("MessageOperateurBrut", event.messageId()));
 
-        // Appel SYNCHRONE — si ça lève, on ne catch rien ici : l'exception
-        // doit remonter pour que @RetryableTopic fasse son travail.
+        log.info("Traitement du message [{}] pour réconciliation", message.getId());
+
+        // 2. Appel IA SYNCHRONE — si ça lève, on ne catch rien ici
         IaExtractionResult result = iaClient.classify(message.getRawContent());
 
+        // 3. Traiter le résultat IA
         reconciliationService.handleIaResult(message.getId(), result);
 
+        // 4. Accusé de réception
         ack.acknowledge();
+
+        log.info("Message [{}] réconcilié avec succès", message.getId());
     }
 
     /**
      * Dernier arrêt après tnb.ia.reconciliation.max-retries tentatives
-     * infructueuses contre le service IA. Le message bascule en AMBIGUOUS
-     * (reprise manuelle admin) plutôt que de rester bloqué indéfiniment.
+     * infructueuses contre le service IA.
      */
     @DltHandler
     public void handleDlt(@Payload ReconciliationEvent event) {
@@ -80,6 +90,8 @@ public class ReconciliationConsumer {
                 .orElseThrow(() -> new ResourceNotFoundException("MessageOperateurBrut", event.messageId()));
 
         message.setProcessingStatus(MessageProcessingStatus.AMBIGUOUS);
+        messageRepository.save(message);
+
         log.error("Message [{}] : service IA injoignable après épuisement des tentatives", message.getId());
 
         notificationService.alertAdmin(

@@ -2,9 +2,10 @@ package TNB.Switch.mapper;
 
 import TNB.Switch.DTO.response.HistoriqueStatutResponse;
 import TNB.Switch.entity.HistoriqueStatut;
+import org.springframework.stereotype.Component;
 
 import java.util.function.Function;
-
+@Component
 public class HistoriqueStatutMapper implements Function<HistoriqueStatut, HistoriqueStatutResponse> {
 
     @Override

@@ -2,9 +2,10 @@ package TNB.Switch.mapper;
 
 import TNB.Switch.DTO.response.FleetMovementResponse;
 import TNB.Switch.entity.FleetMovement;
+import org.springframework.stereotype.Component;
 
 import java.util.function.Function;
-
+@Component
 public class FleetMovementMapper implements Function<FleetMovement, FleetMovementResponse> {
 
     @Override

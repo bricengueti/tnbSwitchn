@@ -3,9 +3,9 @@ package TNB.Switch.repository;
 import TNB.Switch.entity.Otp;
 import TNB.Switch.entity.User;
 import TNB.Switch.enums.OtpStatus;
-import io.lettuce.core.dynamic.annotation.Param;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
 import java.util.List;

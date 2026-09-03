@@ -45,7 +45,7 @@ public class DeviceService {
      * @param operatorCommercialNumbers Map<UUID, String> : opérateurId -> numéro commercial
      * @return DeviceRegistrationResponse contenant l'ID, le pairingCode et le credential (affiché une seule fois)
      */
-    @Transactional
+    @Transactional("transactionManager")
     public DeviceRegistrationResponse registerDevice(String name, Map<UUID, String> operatorCommercialNumbers) {
         if (operatorCommercialNumbers == null || operatorCommercialNumbers.isEmpty()) {
             throw new IllegalArgumentException("Au moins un opérateur doit être spécifié");
@@ -89,7 +89,7 @@ public class DeviceService {
      * Verrouillage pessimiste (findByIdForUpdate) : empêche deux threads
      * de transitionner le même device simultanément.
      */
-    @Transactional
+    @Transactional("transactionManager")
     public Device transitionStatus(UUID deviceId, DeviceStatus target) {
         Device device = deviceRepository.findByIdForUpdate(deviceId)
                 .orElseThrow(() -> new ResourceNotFoundException("Device", deviceId));
@@ -110,7 +110,7 @@ public class DeviceService {
      * Transitionne un device vers HOLDS (prise en charge d'une commande).
      * Appelé par RoutingService lors de l'affectation d'une commande.
      */
-    @Transactional
+    @Transactional("transactionManager")
     public Device markHolds(UUID deviceId) {
         return transitionStatus(deviceId, DeviceStatus.HOLDS);
     }
@@ -119,7 +119,7 @@ public class DeviceService {
      * Transitionne un device vers AVAILABLE (fin d'exécution USSD).
      * Appelé par DeviceStompHandler via CommandDispatcher après ACK.
      */
-    @Transactional
+    @Transactional("transactionManager")
     public Device markAvailable(UUID deviceId) {
         Device device = deviceRepository.findByIdForUpdate(deviceId)
                 .orElseThrow(() -> new ResourceNotFoundException("Device", deviceId));
@@ -135,7 +135,7 @@ public class DeviceService {
      * Met un device en pause (ne reçoit plus de commandes).
      * Action admin uniquement.
      */
-    @Transactional
+    @Transactional("transactionManager")
     public Device pauseDevice(UUID deviceId) {
         Device device = deviceRepository.findByIdForUpdate(deviceId)
                 .orElseThrow(() -> new ResourceNotFoundException("Device", deviceId));
@@ -152,7 +152,7 @@ public class DeviceService {
      * Réactive un device en pause.
      * Action admin uniquement.
      */
-    @Transactional
+    @Transactional("transactionManager")
     public Device resumeDevice(UUID deviceId) {
         Device device = deviceRepository.findByIdForUpdate(deviceId)
                 .orElseThrow(() -> new ResourceNotFoundException("Device", deviceId));
@@ -170,7 +170,7 @@ public class DeviceService {
      * (une commande en cours au moment d'une coupure devient orpheline
      * et repart via le timeout du RoutingService).
      */
-    @Transactional
+    @Transactional("transactionManager")
     public void recordHeartbeat(UUID deviceId) {
         Device device = deviceRepository.findByIdForUpdate(deviceId)
                 .orElseThrow(() -> new ResourceNotFoundException("Device", deviceId));
@@ -187,7 +187,7 @@ public class DeviceService {
      * Détecte et marque OFFLINE les devices dont le heartbeat a expiré.
      * Destiné à être appelé par DeviceHeartbeatWatchdog (@Scheduled).
      */
-    @Transactional
+    @Transactional("transactionManager")
     public int markStaleDevicesOffline(int heartbeatTimeoutSeconds) {
         Instant threshold = Instant.now().minusSeconds(heartbeatTimeoutSeconds);
         var staleDevices = deviceRepository.findStaleHeartbeats(DeviceStatus.OFFLINE, threshold);

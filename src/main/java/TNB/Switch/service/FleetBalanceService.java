@@ -49,7 +49,7 @@ public class FleetBalanceService {
      * couple existe déjà, retourne le solde existant sans écraser son numéro
      * commercial.
      */
-    @Transactional
+    @Transactional("transactionManager")
     public FleetBalance registerBalance(Device device, Operateur operateur, String commercialNumber) {
         if (commercialNumber == null || commercialNumber.isBlank()) {
             throw new IllegalArgumentException(
@@ -69,7 +69,7 @@ public class FleetBalanceService {
      * FleetMovement est TOUJOURS écrit dans la même transaction que la
      * mise à jour du solde — jamais l'un sans l'autre (CDC §7.7).
      */
-    @Transactional
+    @Transactional("transactionManager")
     public FleetBalance debitCredit(UUID fleetBalanceId, BigDecimal amount,
                                     FleetMovementReason reason, String justification,
                                     UUID transactionId) {
@@ -89,7 +89,7 @@ public class FleetBalanceService {
         return balance;
     }
 
-    @Transactional
+    @Transactional("transactionManager")
     public FleetBalance creditCredit(UUID fleetBalanceId, BigDecimal amount,
                                      FleetMovementReason reason, String justification,
                                      UUID transactionId) {
@@ -103,7 +103,7 @@ public class FleetBalanceService {
         return balance;
     }
 
-    @Transactional
+    @Transactional("transactionManager")
     public FleetBalance debitWallet(UUID fleetBalanceId, BigDecimal amount,
                                     FleetMovementReason reason, String justification,
                                     UUID transactionId) {
@@ -123,7 +123,7 @@ public class FleetBalanceService {
         return balance;
     }
 
-    @Transactional
+    @Transactional("transactionManager")
     public FleetBalance creditWallet(UUID fleetBalanceId, BigDecimal amount,
                                      FleetMovementReason reason, String justification,
                                      UUID transactionId) {
@@ -142,7 +142,7 @@ public class FleetBalanceService {
      * contrairement aux mouvements automatiques où elle est optionnelle
      * (le contexte est déjà porté par transactionId).
      */
-    @Transactional
+    @Transactional("transactionManager")
     public FleetBalance manualAdjustment(UUID fleetBalanceId, BigDecimal signedAmount, String justification) {
         if (justification == null || justification.isBlank()) {
             throw new IllegalArgumentException(

@@ -10,6 +10,8 @@ public record TransactionResponse(
         UUID id,
         UserSummaryResponse client,
         OfferSummaryResponse offer,
+        OperateurSummaryResponse fromOperateur,    // ✅ AJOUT
+        OperateurSummaryResponse toOperateur,      // ✅ AJOUT
         BigDecimal amount,
         TransactionStatus status,
         String idempotencyKey,

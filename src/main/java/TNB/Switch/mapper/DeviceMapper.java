@@ -4,11 +4,12 @@ import TNB.Switch.DTO.response.DeviceResponse;
 import TNB.Switch.DTO.response.OperateurSummaryResponse;
 import TNB.Switch.entity.Device;
 import TNB.Switch.entity.Operateur;
+import org.springframework.stereotype.Component;
 
 import java.util.List;
 import java.util.function.Function;
 import java.util.stream.Collectors;
-
+@Component
 public class DeviceMapper implements Function<Device, DeviceResponse> {
 
     private final OperateurSummaryMapper operateurSummaryMapper = new OperateurSummaryMapper();

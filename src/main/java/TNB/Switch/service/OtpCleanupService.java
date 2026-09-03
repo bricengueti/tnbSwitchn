@@ -33,7 +33,7 @@ public class OtpCleanupService {
     // Toutes les 5 minutes — pas besoin d'une fréquence plus fine, le TTL
     // OTP lui-même est de l'ordre de quelques minutes (tnb.otp.ttl-seconds).
     @Scheduled(fixedRate = 300_000)
-    @Transactional
+    @Transactional("transactionManager")
     public void expireStaleOtps() {
         List<Otp> expired = otpRepository.findExpiredPending(OtpStatus.PENDING, Instant.now());
 

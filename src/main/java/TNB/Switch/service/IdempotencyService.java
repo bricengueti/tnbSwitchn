@@ -22,7 +22,7 @@ public class IdempotencyService {
         this.idempotencyRepository = idempotencyRepository;
     }
 
-    @Transactional
+    @Transactional("transactionManager")
     public <T> T executeOnce(String idempotencyKey, ThrowingSupplier<T> action) {
         String redisKey = KEY_PREFIX + idempotencyKey;
 

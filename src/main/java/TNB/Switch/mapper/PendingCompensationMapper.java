@@ -3,9 +3,10 @@ package TNB.Switch.mapper;
 import TNB.Switch.DTO.response.PendingCompensationResponse;
 import TNB.Switch.DTO.response.UserSummaryResponse;
 import TNB.Switch.entity.Transaction;
+import org.springframework.stereotype.Component;
 
 import java.util.function.Function;
-
+@Component
 public class PendingCompensationMapper implements Function<Transaction, PendingCompensationResponse> {
 
     private final UserSummaryMapper userSummaryMapper = new UserSummaryMapper();

@@ -33,9 +33,97 @@ import java.util.Optional;
  * "occupé" immédiatement pour qu'aucun autre agent d'accueil ne lui envoie
  * un second client en même temps.
  *
- * Ce service ne fait JAMAIS lui-même de mutation directe sur Device — il
- * passe systématiquement par DeviceService.transitionStatus(), qui est le
- * seul chemin protégé par verrouillage pessimiste (cf. DeviceService).
+ * =====================================================================
+ *                    ROUTING SERVICE — SCHÉMA COMPLET
+ * =====================================================================
+ *
+ *  ┌─────────────────────────────────────────────────────────────────────┐
+ *  │                    CommandRoutingConsumer                          │
+ *  │                    handleRouting(event)                            │
+ *  └─────────────────────────────┬───────────────────────────────────────┘
+ *                                │
+ *                                ▼
+ *  ┌─────────────────────────────────────────────────────────────────────┐
+ *  │                    RoutingService.routeSingleCommand(commande)     │
+ *  │                                                                     │
+ *  │  ┌─────────────────────────────────────────────────────────────┐   │
+ *  │  │  ÉTAPE 1 : Lister les candidats                             │   │
+ *  │  │                                                             │   │
+ *  │  │  candidates = deviceRepository.findAvailableByOperateur(   │   │
+ *  │  │      DeviceStatus.AVAILABLE, commande.operateur            │   │
+ *  │  │  )                                                          │   │
+ *  │  │                                                             │   │
+ *  │  │  ┌─────────────────────────────────────────────────────┐   │   │
+ *  │  │  │  Device A (AVAILABLE)  ← heartbeat le plus récent  │   │   │
+ *  │  │  │  Device B (AVAILABLE)                              │   │   │
+ *  │  │  │  Device C (AVAILABLE)                              │   │   │
+ *  │  │  └─────────────────────────────────────────────────────┘   │   │
+ *  │  └─────────────────────────────────────────────────────────────┘   │
+ *  │                                │                                  │
+ *  │                                ▼                                  │
+ *  │  ┌─────────────────────────────────────────────────────────────┐   │
+ *  │  │  ÉTAPE 2 : Parcourir les candidats                         │   │
+ *  │  │                                                             │   │
+ *  │  │  for (Device candidate : candidates) {                     │   │
+ *  │  │      assigned = tryAssign(commande, candidate)            │   │
+ *  │  │      if (assigned.isPresent()) return assigned            │   │
+ *  │  │  }                                                         │   │
+ *  │  └─────────────────────────────────────────────────────────────┘   │
+ *  │                                │                                  │
+ *  │                                ▼                                  │
+ *  │  ┌─────────────────────────────────────────────────────────────┐   │
+ *  │  │  ÉTAPE 3 : tryAssign(commande, candidate)                  │   │
+ *  │  │                                                             │   │
+ *  │  │  ┌─────────────────────────────────────────────────────┐   │   │
+ *  │  │  │  Vérifier le solde (FleetBalance)                   │   │   │
+ *  │  │  │  if (phase == EXECUTION) {                         │   │   │
+ *  │  │  │      if (!hasSufficientBalance()) return empty     │   │   │
+ *  │  │  │  }                                                  │   │   │
+ *  │  │  └─────────────────────────────────────────────────────┘   │   │
+ *  │  │                                │                          │   │
+ *  │  │                                ▼                          │   │
+ *  │  │  ┌─────────────────────────────────────────────────────┐   │   │
+ *  │  │  │  Verrouiller le device                              │   │   │
+ *  │  │  │  Device locked = deviceService.transitionStatus(   │   │   │
+ *  │  │  │      candidate.id, DeviceStatus.HOLDS              │   │   │
+ *  │  │  │  )                                                  │   │   │
+ *  │  │  │  ← Verrouillage pessimiste (findByIdForUpdate)    │   │   │
+ *  │  │  └─────────────────────────────────────────────────────┘   │   │
+ *  │  │                                │                          │   │
+ *  │  │                                ▼                          │   │
+ *  │  │  ┌─────────────────────────────────────────────────────┐   │   │
+ *  │  │  │  Assigner et enregistrer                            │   │   │
+ *  │  │  │  commande.setDevice(locked)                        │   │   │
+ *  │  │  │  commandeRepository.save(commande)                 │   │   │
+ *  │  │  └─────────────────────────────────────────────────────┘   │   │
+ *  │  │                                │                          │   │
+ *  │  │                                ▼                          │   │
+ *  │  │  ┌─────────────────────────────────────────────────────┐   │   │
+ *  │  │  │  Envoyer au device via STOMP                        │   │   │
+ *  │  │  │  commandDispatcher.dispatch(locked, commande)      │   │   │
+ *  │  │  └─────────────────────────────────────────────────────┘   │   │
+ *  │  │                                │                          │   │
+ *  │  │                                ▼                          │   │
+ *  │  │  ┌─────────────────────────────────────────────────────┐   │   │
+ *  │  │  │  Retourner le device assigné                        │   │   │
+ *  │  │  │  return Optional.of(locked)                        │   │   │
+ *  │  │  └─────────────────────────────────────────────────────┘   │   │
+ *  │  └─────────────────────────────────────────────────────────────┘   │
+ *  └─────────────────────────────────────────────────────────────────────┘
+ *                                │
+ *                                ▼
+ *  ┌─────────────────────────────────────────────────────────────────────┐
+ *  │  SI AUCUN CANDIDAT DISPONIBLE :                                     │
+ *  │  → NoAvailableDeviceException                                      │
+ *  │  → CommandRoutingConsumer.@RetryableTopic → retry + backoff       │
+ *  └─────────────────────────────────────────────────────────────────────┘
+ *
+ * =====================================================================
+ *  LÉGENDE :
+ *    ───  = Flux normal
+ *    - - - = Flux alternatif (candidat suivant)
+ *    ••••  = Flux d'échec (NoAvailableDeviceException)
+ * =====================================================================
  */
 @Service
 public class RoutingService {
@@ -46,7 +134,6 @@ public class RoutingService {
     private final DeviceRepository deviceRepository;
     private final FleetBalanceRepository fleetBalanceRepository;
     private final DeviceService deviceService;
-    // RoutingService — ajout de la dépendance
     private final CommandDispatcher commandDispatcher;
 
     public RoutingService(CommandeRepository commandeRepository,
@@ -61,19 +148,39 @@ public class RoutingService {
         this.commandDispatcher = commandDispatcher;
     }
 
-
+    // =====================================================================
+    //  ROUTAGE
+    // =====================================================================
 
     /**
      * Route UNE commande précise. C'est ici que se joue toute la logique :
      * trouver un guichetier (Device) libre, compétent (supporte
      * l'opérateur demandé), et disposant du "tiroir-caisse" suffisant
      * (FleetBalance) pour honorer la demande — puis l'affecter.
+     *
+     * ┌─────────────────────────────────────────────────────────────────┐
+     * │  ÉTAPE 1 : Lister les candidats AVAILABLE pour l'opérateur    │
+     * │  ───────────────────────────────────────────────────────────── │
+     * │  candidates = deviceRepository.findAvailableByOperateur(     │
+     * │      DeviceStatus.AVAILABLE, commande.operateur             │
+     * │  )                                                            │
+     * │  Tri : order by lastHeartbeat DESC (le plus récent d'abord)  │
+     * │                                                               │
+     * │  ÉTAPE 2 : Parcourir les candidats                            │
+     * │  ───────────────────────────────────────────────────────────── │
+     * │  for (Device candidate : candidates) {                       │
+     * │      assigned = tryAssign(commande, candidate)              │
+     * │      if (assigned.isPresent()) return assigned              │
+     * │  }                                                           │
+     * │                                                               │
+     * │  ÉTAPE 3 : Aucun candidat → NoAvailableDeviceException       │
+     * └─────────────────────────────────────────────────────────────────┘
      */
-    @Transactional
+    @Transactional("transactionManager")
     public Device routeSingleCommand(Commande commande) {
         Operateur operateur = commande.getOperateur();
 
-        // Étape 1 — dresser la liste des guichetiers a priori disponibles
+        // ÉTAPE 1 — dresser la liste des guichetiers a priori disponibles
         // et compétents pour cet opérateur (triés par heartbeat le plus
         // récent : on privilégie le guichetier le plus "réveillé", donc
         // le plus probablement fiable en ce moment).
@@ -82,10 +189,13 @@ public class RoutingService {
         );
 
         if (candidates.isEmpty()) {
+            log.warn("Aucun device AVAILABLE pour l'opérateur [{}]", operateur.getCode());
             throw new NoAvailableDeviceException(operateur.getCode());
         }
 
-        // Étape 2 — parcourir les candidats un par un. Comme deux agents
+        log.debug("{} candidats pour l'opérateur [{}]", candidates.size(), operateur.getCode());
+
+        // ÉTAPE 2 — parcourir les candidats un par un. Comme deux agents
         // d'accueil peuvent regarder la même liste au même instant, le
         // guichetier en tête de liste peut déjà avoir été pris par un
         // autre agent entre le moment où on l'a vu "libre" et le moment
@@ -100,8 +210,15 @@ public class RoutingService {
             }
         }
 
+        // ÉTAPE 3 — aucun candidat n'a pu être verrouillé
+        log.warn("Aucun device disponible pour l'opérateur [{}] (tous pris ou solde insuffisant)",
+                operateur.getCode());
         throw new NoAvailableDeviceException(operateur.getCode());
     }
+
+    // =====================================================================
+    //  TENTATIVE D'ASSIGNATION
+    // =====================================================================
 
     /**
      * Tentative d'affectation sur UN guichetier précis. Retourne un
@@ -109,9 +226,46 @@ public class RoutingService {
      * précis n'a pas pu être verrouillé ou n'a pas les fonds suffisants —
      * ça permet à l'appelant d'essayer le candidat suivant sans que ce
      * soit un vrai échec du processus global.
+     *
+     * ┌─────────────────────────────────────────────────────────────────┐
+     * │  tryAssign(commande, candidate)                               │
+     * │                                                                 │
+     * │  ┌─────────────────────────────────────────────────────────┐   │
+     * │  │  1. Vérifier le solde (si phase == EXECUTION)          │   │
+     * │  │     if (!hasSufficientBalance()) return empty          │   │
+     * │  └─────────────────────────────────────────────────────────┘   │
+     * │                              │                                  │
+     * │                              ▼                                  │
+     * │  ┌─────────────────────────────────────────────────────────┐   │
+     * │  │  2. Verrouiller le device                               │   │
+     * │  │     Device locked = deviceService.transitionStatus(    │   │
+     * │  │         candidate.id, DeviceStatus.HOLDS               │   │
+     * │  │     )                                                   │   │
+     * │  │     ← Verrouillage pessimiste (findByIdForUpdate)     │   │
+     * │  └─────────────────────────────────────────────────────────┘   │
+     * │                              │                                  │
+     * │                              ▼                                  │
+     * │  ┌─────────────────────────────────────────────────────────┐   │
+     * │  │  3. Assigner et enregistrer                             │   │
+     * │  │     commande.setDevice(locked)                         │   │
+     * │  │     commandeRepository.save(commande)                  │   │
+     * │  └─────────────────────────────────────────────────────────┘   │
+     * │                              │                                  │
+     * │                              ▼                                  │
+     * │  ┌─────────────────────────────────────────────────────────┐   │
+     * │  │  4. Envoyer au device via STOMP                         │   │
+     * │  │     commandDispatcher.dispatch(locked, commande)       │   │
+     * │  └─────────────────────────────────────────────────────────┘   │
+     * │                              │                                  │
+     * │                              ▼                                  │
+     * │  ┌─────────────────────────────────────────────────────────┐   │
+     * │  │  5. Retourner le device assigné                         │   │
+     * │  │     return Optional.of(locked)                         │   │
+     * │  └─────────────────────────────────────────────────────────┘   │
+     * └─────────────────────────────────────────────────────────────────┘
      */
     private Optional<Device> tryAssign(Commande commande, Device candidate) {
-        // Vérification du "tiroir-caisse" AVANT de verrouiller le
+        // 1. Vérification du "tiroir-caisse" AVANT de verrouiller le
         // guichetier : inutile de bloquer un device si, de toute façon,
         // il n'a pas les fonds pour honorer la commande — autant laisser
         // ce guichetier libre pour une commande qu'il peut réellement traiter.
@@ -123,7 +277,7 @@ public class RoutingService {
         }
 
         try {
-            // C'est ici que le verrouillage pessimiste entre en jeu (dans
+            // 2. C'est ici que le verrouillage pessimiste entre en jeu (dans
             // DeviceService.transitionStatus, via findByIdForUpdate) :
             // AVANT que cet appel ne retourne, aucun autre thread ne peut
             // voir ce même device et tenter de le verrouiller en même
@@ -131,19 +285,14 @@ public class RoutingService {
             // qu'on y entre, empêchant quiconque d'autre d'y entrer aussi.
             Device locked = deviceService.transitionStatus(candidate.getId(), DeviceStatus.HOLDS);
 
+            // 3. Assigner et enregistrer
             commande.setDevice(locked);
             commandeRepository.save(commande);
 
-            log.info("Commande [{}] affectée au device [{}]", commande.getId(), locked.getId());
-            // Dans tryAssign, juste avant le "return Optional.of(locked)" existant :
-
-
-            commande.setDevice(locked);
-            commandeRepository.save(commande);
-
-// Envoi physique au device — dernier maillon du routage.
+            // 4. Envoyer au device via STOMP
             commandDispatcher.dispatch(locked, commande);
 
+            // 5. Retourner le device assigné
             log.info("Commande [{}] affectée au device [{}]", commande.getId(), locked.getId());
             return Optional.of(locked);
 
@@ -157,17 +306,43 @@ public class RoutingService {
         }
     }
 
+    // =====================================================================
+    //  VÉRIFICATION DU SOLDE
+    // =====================================================================
+
     /**
      * Vérifie que le device a de quoi honorer la commande d'EXÉCUTION —
      * comme vérifier que le tiroir-caisse du guichetier contient assez
      * d'argent avant de lui envoyer un client qui veut retirer une
      * certaine somme.
      *
-     * ⚠️ Simplification actuelle : compare le montant de la Transaction
-     * au solde crédit du device par défaut. Ne distingue pas encore
-     * précisément crédit vs wallet selon le OfferType (CREDIT/DATA vs
-     * EXCHANGE_MO) — à affiner une fois TransactionService écrit et le
-     * type d'offre accessible facilement depuis ce contexte.
+     * ┌─────────────────────────────────────────────────────────────────┐
+     * │  hasSufficientBalance(device, commande)                       │
+     * │                                                                 │
+     * │  ┌─────────────────────────────────────────────────────────┐   │
+     * │  │  offerType = commande.transaction.offer.type           │   │
+     * │  │  amount = commande.transaction.amount                  │   │
+     * │  └─────────────────────────────────────────────────────────┘   │
+     * │                              │                                  │
+     * │                              ▼                                  │
+     * │  ┌─────────────────────────────────────────────────────────┐   │
+     * │  │  balance = fleetBalanceRepository                      │   │
+     * │  │      .findByDeviceAndOperateur(device, operateur)     │   │
+     * │  └─────────────────────────────────────────────────────────┘   │
+     * │                              │                                  │
+     * │                              ▼                                  │
+     * │  ┌─────────────────────────────────────────────────────────┐   │
+     * │  │  available = switch (offerType) {                      │   │
+     * │  │      EXCHANGE_MO → balance.walletBalance              │   │
+     * │  │      CREDIT/DATA  → balance.creditBalance             │   │
+     * │  │  }                                                     │   │
+     * │  └─────────────────────────────────────────────────────────┘   │
+     * │                              │                                  │
+     * │                              ▼                                  │
+     * │  ┌─────────────────────────────────────────────────────────┐   │
+     * │  │  return available >= amount                            │   │
+     * │  └─────────────────────────────────────────────────────────┘   │
+     * └─────────────────────────────────────────────────────────────────┘
      */
     private boolean hasSufficientBalance(Device device, Commande commande) {
         BigDecimal amount = commande.getTransaction().getAmount();
@@ -176,6 +351,8 @@ public class RoutingService {
 
         Optional<FleetBalance> balance = fleetBalanceRepository.findByDeviceAndOperateur(device, operateur);
         if (balance.isEmpty()) {
+            log.debug("Aucun FleetBalance pour device [{}] / opérateur [{}]",
+                    device.getId(), operateur.getCode());
             return false;
         }
 
@@ -183,6 +360,13 @@ public class RoutingService {
                 ? balance.get().getWalletBalance()
                 : balance.get().getCreditBalance();
 
-        return available.compareTo(amount) >= 0;
+        boolean sufficient = available.compareTo(amount) >= 0;
+
+        if (!sufficient) {
+            log.debug("Solde insuffisant pour device [{}] : disponible={}, demandé={}",
+                    device.getId(), available, amount);
+        }
+
+        return sufficient;
     }
 }

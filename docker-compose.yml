@@ -1,0 +1,42 @@
+networks:
+  tnb-shared:
+    external: true
+
+services:
+
+  # ============================================================
+  #  TNBSWITCH BACKEND  (paramétré par environnement via .env)
+  # ============================================================
+  tnbswitch-backend:
+    image: ${IMAGE_NAME}:${IMAGE_TAG:-latest}
+    container_name: ${CONTAINER_NAME}
+    restart: always
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - SPRING_PROFILES_ACTIVE=${SPRING_PROFILES_ACTIVE}
+      - SERVER_PORT=${SERVER_PORT}
+      - MANAGEMENT_SERVER_PORT=${MANAGEMENT_SERVER_PORT}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - KAFKA_BROKERS=${KAFKA_BROKERS}
+      - KAFKA_TOPIC_PREFIX=${KAFKA_TOPIC_PREFIX}
+      - KAFKA_CONSUMER_GROUP_ID=${KAFKA_CONSUMER_GROUP_ID}
+      - JWT_SECRET=${JWT_SECRET}
+      - DEVICE_JWT_SECRET=${DEVICE_JWT_SECRET}
+      - SMS_PROVIDER=${SMS_PROVIDER:-mock}
+      - SEED_ADMIN_ENABLED=${SEED_ADMIN_ENABLED:-false}
+      - SEED_ADMIN_PHONE_NUMBER=${SEED_ADMIN_PHONE_NUMBER:-}
+      - IA_RECONCILIATION_URL=${IA_RECONCILIATION_URL:-}
+    ports:
+      - "${SERVER_PORT}:${SERVER_PORT}"
+      - "${MANAGEMENT_SERVER_PORT}:${MANAGEMENT_SERVER_PORT}"
+    volumes:
+      - ./logs:/app/logs
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    networks:
+      - tnb-shared

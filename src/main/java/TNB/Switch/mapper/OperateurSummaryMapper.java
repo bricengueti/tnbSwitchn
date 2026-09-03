@@ -2,9 +2,10 @@ package TNB.Switch.mapper;
 
 import TNB.Switch.DTO.response.OperateurSummaryResponse;
 import TNB.Switch.entity.Operateur;
+import org.springframework.stereotype.Component;
 
 import java.util.function.Function;
-
+@Component
 public class OperateurSummaryMapper implements Function<Operateur, OperateurSummaryResponse> {
 
     @Override

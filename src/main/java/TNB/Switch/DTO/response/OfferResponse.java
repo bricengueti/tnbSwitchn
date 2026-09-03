@@ -9,8 +9,6 @@ public record OfferResponse(
         UUID id,
         OfferType type,
         String label,
-        OperateurSummaryResponse sourceOperator,
-        OperateurSummaryResponse destinationOperator,
         BigDecimal price,
         BigDecimal creditAmount,
         Integer dataVolumeMb,
@@ -18,8 +16,7 @@ public record OfferResponse(
         BigDecimal exchangeRate,
         BigDecimal minAmount,
         BigDecimal maxAmount,
-        OfferFee offerFee,
-        String withdrawalTemplateContent,   // ✅ Template de retrait (depuis l'opérateur)
-        String executionTemplateContent,     // ✅ Template d'exécution (spécifique à l'offre)
+        BigDecimal offerFeePercentage,
         boolean active
+        // ❌ Plus de sourceOperatorId, destinationOperatorId
 ) {}

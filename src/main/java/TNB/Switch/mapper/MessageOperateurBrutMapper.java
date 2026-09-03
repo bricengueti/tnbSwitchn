@@ -4,9 +4,10 @@ import TNB.Switch.DTO.response.DeviceSummaryResponse;
 import TNB.Switch.DTO.response.MessageOperateurBrutResponse;
 import TNB.Switch.DTO.response.OperateurSummaryResponse;
 import TNB.Switch.entity.MessageOperateurBrut;
+import org.springframework.stereotype.Component;
 
 import java.util.function.Function;
-
+@Component
 public class MessageOperateurBrutMapper implements Function<MessageOperateurBrut, MessageOperateurBrutResponse> {
 
     private final DeviceSummaryMapper deviceSummaryMapper = new DeviceSummaryMapper();

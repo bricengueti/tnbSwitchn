@@ -1,5 +1,6 @@
 package TNB.Switch.service;
 
+import TNB.Switch.DTO.response.AuthResponse;
 import TNB.Switch.config.TokenPair;
 import TNB.Switch.entity.Otp;
 import TNB.Switch.entity.User;
@@ -98,7 +99,7 @@ public class AuthService {
      * invalide/expiré/épuisé ; ne retourne rien si valide, chaque appelant
      * décide de la suite.
      */
-    @Transactional
+    @Transactional("transactionManager")
     public void verifyOtp(String phoneNumber, String code) {
         User user = userRepository.findByPhoneNumber(phoneNumber)
                 .orElseThrow(OtpInvalidException::new);
@@ -142,8 +143,8 @@ public class AuthService {
      * simple appelant de verifyOtp, qui porte toute la logique de
      * vérification.
      */
-    @Transactional
-    public AuthResult validateOtp(String phoneNumber, String code) {
+    @Transactional("transactionManager")
+    public AuthResponse validateOtp(String phoneNumber, String code) {
         verifyOtp(phoneNumber, code);
 
         User user = userRepository.findByPhoneNumber(phoneNumber)
@@ -153,7 +154,7 @@ public class AuthService {
 
         log.info("Connexion réussie pour l'utilisateur [{}], isAdmin={}", user.getId(), user.isAdmin());
 
-        return new AuthResult(tokens, user.isAdmin());
+        return new AuthResponse(tokens, user.isAdmin());
     }
 
     private String generateNumericCode(int length) {
@@ -164,5 +165,5 @@ public class AuthService {
         return sb.toString();
     }
 
-    public record AuthResult(TokenPair tokens, boolean isAdmin) {}
+
 }
