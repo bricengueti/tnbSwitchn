@@ -1,7 +1,7 @@
 # Infra partagée — bootstrap idempotent par le JOB 1 de la pipeline.
 # Crée aussi le réseau "tnb-shared" que le backend rejoint en external.
 # Subnet fixée explicitement pour pouvoir écrire des règles ufw / pg_hba.conf
-# stables, indépendamment de l'allocation automatique de Docker.
+
 
 networks:
   tnb-shared:
