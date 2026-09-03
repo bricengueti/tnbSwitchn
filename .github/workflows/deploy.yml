@@ -1,14 +1,5 @@
-name: CI/CD Pipeline - tnbSwitch Backend
+name: CI/CD Pipeline - TnbSwitch Backend
 
-# PRÉREQUIS (une seule fois, à la main, avant le premier run de cette pipeline) :
-#   scp docker-compose.yml <vps>:/home/ubuntu/tnb-switch/infra/
-#   cd /home/ubuntu/tnb-switch/infra && docker compose --profile infra up -d
-# -> démarre zookeeper/kafka/kafka-ui une fois pour toutes, partagés
-#    entre dev/preprod/prod. Cette pipeline ne les touche JAMAIS :
-#    `docker compose up -d` (sans --profile) ignore par défaut tout
-#    service portant `profiles: ["infra"]`.
-#
-# Déclenchement : chaque branche pousse sur un environnement dédié.
 # develop -> dev | preprod -> preprod | main -> prod
 on:
   push:
@@ -20,32 +11,60 @@ on:
 jobs:
 
   # ============================================================
-  # JOB 1 — Mappe la branche poussée vers l'environnement GitHub
-  # (dev/preprod/prod) et vers le nom de dossier sur le serveur
+  # JOB 1 — Bootstrap / mise à jour de l'infra partagée (zookeeper,
+  # kafka, kafka-ui + réseau tnb-shared). Tourne à CHAQUE push, mais
+  # est idempotent : si l'infra existe déjà et n'a pas changé,
+  # "docker compose up -d" ne fait rien. Utilise uniquement des
+  # secrets/variables au niveau repo (pas d'Environment requis),
+  # donc jamais bloqué par une règle de protection d'Environment.
   # ============================================================
-  set-env:
+  deploy-infra:
     runs-on: ubuntu-latest
-    outputs:
-      gh_environment: ${{ steps.map.outputs.gh_environment }}
-    steps:
-      - id: map
-        run: |
-          case "${{ github.ref_name }}" in
-            develop) echo "gh_environment=dev" >> "$GITHUB_OUTPUT" ;;
-            preprod) echo "gh_environment=preprod" >> "$GITHUB_OUTPUT" ;;
-            main)    echo "gh_environment=prod" >> "$GITHUB_OUTPUT" ;;
-          esac
-
-  # ============================================================
-  # JOB 2 — Build l'image Docker et la pousse sur Docker Hub
-  # ============================================================
-  build-and-push:
-    needs: set-env
-    runs-on: ubuntu-latest
-    environment: ${{ needs.set-env.outputs.gh_environment }}
+    concurrency:
+      group: deploy-infra
+      cancel-in-progress: false
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
+
+      - name: Copie du docker-compose.infra.yml sur le serveur
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_SSH_HOST }}
+          username: ${{ secrets.VPS_SSH_USER }}
+          key: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          source: "docker-compose.infra.yml"
+          target: "/home/ubuntu/tnb-switch/"
+
+      - name: Bootstrap / update de l'infra via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_SSH_HOST }}
+          username: ${{ secrets.VPS_SSH_USER }}
+          key: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            mkdir -p /home/ubuntu/tnb-switch
+            cd /home/ubuntu/tnb-switch
+            # Crée le réseau + zookeeper/kafka/kafka-ui s'ils n'existent pas
+            # encore ; ne les touche pas s'ils tournent déjà à l'identique.
+            docker compose -f docker-compose.infra.yml up -d
+
+  # ============================================================
+  # JOB 2 — Build l'image Docker et la pousse sur Docker Hub
+  # (le jar est buildé DANS le Dockerfile, tests déjà skippés
+  # via -DskipTests dans son builder stage — pas besoin de le
+  # refaire sur le runner)
+  # ============================================================
+  build-and-push:
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'preprod' && 'preprod' || 'dev' }}
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Configuration de Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Connexion à Docker Hub
         uses: docker/login-action@v3
@@ -60,45 +79,50 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: ${{ vars.IMAGE_NAME }}:${{ vars.IMAGE_TAG }}
+          cache-from: type=registry,ref=${{ vars.IMAGE_NAME }}:${{ vars.IMAGE_TAG }}
+          cache-to: type=inline
 
   # ============================================================
-  # JOB 3 — Déploie le backend sur le serveur via SSH, dans un
-  # dossier dédié à l'environnement. `docker compose up -d` (sans
-  # --profile) n'inclut que tnbswitch-backend — kafka/zookeeper/
-  # kafka-ui (profil "infra") restent hors de portée, quel que
-  # soit le nombre de fois où cette pipeline tourne.
+  # JOB 3 — Déploie UNIQUEMENT le backend sur le serveur via SSH.
+  # Attend que l'infra soit prête (job 1) avant de démarrer, pour
+  # être sûr que le réseau tnb-shared existe déjà.
   # ============================================================
   deploy:
     runs-on: ubuntu-latest
-    needs: [set-env, build-and-push]
-    environment: ${{ needs.set-env.outputs.gh_environment }}
+    needs: [deploy-infra, build-and-push]
+    environment: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'preprod' && 'preprod' || 'dev' }}
     concurrency:
-      group: deploy-${{ needs.set-env.outputs.gh_environment }}
+      group: deploy-${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'preprod' && 'preprod' || 'dev' }}
       cancel-in-progress: false
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
 
-      - name: Copie du docker-compose.yml sur le serveur
+      - name: Copie du docker-compose.yml sur le serveur (racine partagée)
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_SSH_HOST }}
           username: ${{ secrets.VPS_SSH_USER }}
           key: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
           source: "docker-compose.yml"
-          target: "/home/ubuntu/tnb-switch/${{ needs.set-env.outputs.gh_environment }}/"
+          target: "/home/ubuntu/tnb-switch/"
 
-      - name: Déploiement automatique sur le serveur via SSH
+      - name: Déploiement + healthcheck sur le serveur via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VPS_SSH_HOST }}
           username: ${{ secrets.VPS_SSH_USER }}
           key: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
           script: |
-            mkdir -p /home/ubuntu/tnb-switch/${{ needs.set-env.outputs.gh_environment }}/logs
-            cd /home/ubuntu/tnb-switch/${{ needs.set-env.outputs.gh_environment }}
+            set -e
+            ENV_NAME=${{ vars.SPRING_PROFILES_ACTIVE }}
+            ROOT=/home/ubuntu/tnb-switch
+            ENV_DIR=$ROOT/$ENV_NAME
 
-            cat > .env <<EOF
+            mkdir -p "$ENV_DIR/logs"
+            cd "$ROOT"
+
+            cat > "$ENV_DIR/.env" <<EOF
             IMAGE_NAME=${{ vars.IMAGE_NAME }}
             IMAGE_TAG=${{ vars.IMAGE_TAG }}
             CONTAINER_NAME=${{ vars.CONTAINER_NAME }}
@@ -120,21 +144,32 @@ jobs:
             SEED_ADMIN_PHONE_NUMBER=${{ vars.SEED_ADMIN_PHONE_NUMBER }}
             IA_RECONCILIATION_URL=${{ vars.IA_RECONCILIATION_URL }}
             EOF
-            chmod 600 .env
+            chmod 600 "$ENV_DIR/.env"
 
             docker pull ${{ vars.IMAGE_NAME }}:${{ vars.IMAGE_TAG }}
-            docker compose --env-file .env up -d --remove-orphans
+
+            # --project-directory : isole ./logs et l'identité du projet par
+            #   environnement, sans toucher au docker-compose.yml (unique).
+            # -p tnbswitch-$ENV_NAME : projet Compose distinct par env, pour
+            #   que preprod/prod ne remplacent jamais le conteneur backend de dev.
+            # Le réseau "tnb-shared" (déclaré external: true dans le fichier)
+            #   relie automatiquement ce backend à kafka, sans rien de plus.
+            docker compose -f docker-compose.yml \
+              --project-directory "$ENV_DIR" \
+              --env-file "$ENV_DIR/.env" \
+              -p "tnbswitch-$ENV_NAME" \
+              up -d --remove-orphans tnbswitch-backend
+
             docker image prune -f
 
-      - name: Vérification du déploiement (healthcheck sur le port management)
-        run: |
-          for i in $(seq 1 20); do
-            if curl -sf http://${{ secrets.VPS_SSH_HOST }}:${{ vars.MANAGEMENT_SERVER_PORT }}/actuator/health; then
-              echo "✅ Application prête"
-              exit 0
-            fi
-            echo "Tentative $i/20 — application pas encore prête, nouvel essai dans 10s..."
-            sleep 10
-          done
-          echo "❌ L'application n'a jamais répondu après 200s"
-          exit 1
+            echo "Vérification du déploiement (healthcheck sur le port management)..."
+            for i in $(seq 1 20); do
+              if curl -sf "http://localhost:${{ vars.MANAGEMENT_SERVER_PORT }}/actuator/health"; then
+                echo "✅ Application prête"
+                exit 0
+              fi
+              echo "Tentative $i/20 — application pas encore prête, nouvel essai dans 10s..."
+              sleep 10
+            done
+            echo "❌ L'application n'a jamais répondu après 200s"
+            exit 1

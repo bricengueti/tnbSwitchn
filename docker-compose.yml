@@ -1,12 +1,13 @@
+# Backend seul. Déployé plusieurs fois (une par environnement) via
+# `docker compose -p tnbswitch-<env> --project-directory <dir> up -d`
+# Rejoint le réseau "tnb-shared" créé par docker-compose.infra.yml.
+
 networks:
   tnb-shared:
     external: true
 
 services:
 
-  # ============================================================
-  #  TNBSWITCH BACKEND  (paramétré par environnement via .env)
-  # ============================================================
   tnbswitch-backend:
     image: ${IMAGE_NAME}:${IMAGE_TAG:-latest}
     container_name: ${CONTAINER_NAME}
